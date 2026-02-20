@@ -1,15 +1,9 @@
 """
 Flow EVM Balance Watcher Bot
-Совместим с Google Colab, Jupyter и обычным Python.
+Хранит состояние в Redis (Railway) или в памяти (fallback).
 
 Установка:
-    pip install "web3>=6.0" python-telegram-bot aiohttp nest_asyncio
-
-Конфигурация:
-    TELEGRAM_TOKEN   — токен от @BotFather
-    TELEGRAM_CHAT_ID — ID чата (необязательно)
-    FLOW_RPC         — HTTP RPC Flow EVM
-    POLL_INTERVAL    — интервал проверки блоков в секундах (default: 5)
+    pip install "web3>=6.0" python-telegram-bot aiohttp nest_asyncio redis
 """
 
 import asyncio
@@ -17,10 +11,9 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Optional
 
-# Патч для Colab/Jupyter — разрешает запуск asyncio внутри уже работающего loop
+# Патч для Colab/Jupyter
 try:
     import nest_asyncio
     nest_asyncio.apply()
@@ -38,7 +31,7 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 FLOW_RPC         = os.getenv("FLOW_RPC", "https://mainnet.evm.nodes.onflow.org")
 POLL_INTERVAL    = int(os.getenv("POLL_INTERVAL", "5"))
-STATE_FILE       = Path("state.json")
+REDIS_URL        = os.getenv("REDIS_URL", "")  # автоматически задаётся Railway при подключении Redis
 
 # ─── Логирование ─────────────────────────────────────────────────────────────
 
@@ -48,17 +41,45 @@ logging.basicConfig(
 )
 log = logging.getLogger("flow_bot")
 
-# ─── Хранилище состояния ─────────────────────────────────────────────────────
+# ─── Хранилище состояния (Redis или память) ──────────────────────────────────
+
+redis_client = None
+
+def init_redis():
+    global redis_client
+    if not REDIS_URL:
+        log.warning("REDIS_URL не задан — состояние хранится в памяти и сбросится при перезапуске!")
+        return
+    try:
+        import redis
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+        log.info("Redis подключён: %s", REDIS_URL)
+    except Exception as e:
+        log.error("Ошибка подключения к Redis: %s — работаю без него", e)
+        redis_client = None
+
+# In-memory fallback
+_memory_state = {"addresses": {}, "chat_ids": []}
 
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"addresses": {}, "chat_ids": []}
+    if redis_client:
+        try:
+            data = redis_client.get("bot_state")
+            if data:
+                return json.loads(data)
+        except Exception as e:
+            log.error("Ошибка чтения из Redis: %s", e)
+    return _memory_state
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
-
-state = load_state()
+    global _memory_state
+    _memory_state = state
+    if redis_client:
+        try:
+            redis_client.set("bot_state", json.dumps(state))
+        except Exception as e:
+            log.error("Ошибка записи в Redis: %s", e)
 
 # ─── Web3 ────────────────────────────────────────────────────────────────────
 
@@ -77,6 +98,7 @@ def wei_to_flow(wei: int) -> str:
     return f"{wei / 10**18:.8f}"
 
 async def notify(app: Application, text: str, chat_id: Optional[int] = None):
+    state = load_state()
     targets = []
     if chat_id:
         targets = [chat_id]
@@ -94,10 +116,12 @@ async def notify(app: Application, text: str, chat_id: Optional[int] = None):
 # ─── Мониторинг ──────────────────────────────────────────────────────────────
 
 async def check_balances(app: Application):
+    state = load_state()
     addresses = state.get("addresses", {})
     if not addresses:
         return
 
+    changed = False
     for addr, info in list(addresses.items()):
         try:
             new_balance = await get_balance(addr)
@@ -105,7 +129,7 @@ async def check_balances(app: Application):
 
             if old_balance == -1:
                 state["addresses"][addr]["balance"] = str(new_balance)
-                save_state(state)
+                changed = True
                 continue
 
             if new_balance != old_balance:
@@ -121,10 +145,13 @@ async def check_balances(app: Application):
                 )
                 await notify(app, msg, info.get("chat_id"))
                 state["addresses"][addr]["balance"] = str(new_balance)
-                save_state(state)
+                changed = True
 
         except Exception as e:
             log.error("Ошибка при проверке %s: %s", addr, e)
+
+    if changed:
+        save_state(state)
 
 async def monitor_loop(app: Application):
     log.info("Мониторинг запущен. RPC: %s, интервал: %s сек.", FLOW_RPC, POLL_INTERVAL)
@@ -148,6 +175,7 @@ def is_valid_address(addr: str) -> bool:
     return bool(re.match(r"^0x[0-9a-fA-F]{40}$", addr))
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
     chat_id = update.effective_chat.id
     if chat_id not in state["chat_ids"]:
         state["chat_ids"].append(chat_id)
@@ -165,6 +193,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
     if not ctx.args:
         await update.message.reply_text("Использование: /add <code>0xАДРЕС</code>", parse_mode="HTML")
         return
@@ -196,6 +225,7 @@ async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
     if not ctx.args:
         await update.message.reply_text("Использование: /remove <code>0xАДРЕС</code>", parse_mode="HTML")
         return
@@ -210,6 +240,7 @@ async def cmd_remove(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 Адрес <code>{addr}</code> удалён.", parse_mode="HTML")
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
     addresses = state.get("addresses", {})
     if not addresses:
         await update.message.reply_text("📭 Нет отслеживаемых адресов.")
@@ -242,15 +273,19 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
     try:
         block = await get_block_number()
         status = f"✅ Подключён | Блок: #{block}"
     except Exception as e:
         status = f"❌ Нет подключения: {e}"
 
+    storage = "Redis ✅" if redis_client else "Память ⚠️ (данные сбросятся при перезапуске)"
+
     await update.message.reply_text(
         f"🔗 RPC: {FLOW_RPC}\n"
         f"Статус: {status}\n"
+        f"💾 Хранилище: {storage}\n"
         f"👀 Адресов: {len(state.get('addresses', {}))}\n"
         f"⏱ Интервал: {POLL_INTERVAL} сек.",
     )
@@ -258,10 +293,11 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 async def run_bot():
-    """Асинхронная точка входа — работает в Colab, Jupyter и обычном Python."""
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN":
         log.error("Установите переменную TELEGRAM_TOKEN!")
         return
+
+    init_redis()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -276,9 +312,8 @@ async def run_bot():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    log.info("Бот запущен! Нажмите Ctrl+C для остановки.")
+    log.info("Бот запущен!")
 
-    # Запускаем мониторинг параллельно с ботом
     try:
         await monitor_loop(app)
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -289,7 +324,6 @@ async def run_bot():
         await app.shutdown()
 
 def main():
-    """Обычный запуск (не Colab)."""
     asyncio.run(run_bot())
 
 if __name__ == "__main__":
